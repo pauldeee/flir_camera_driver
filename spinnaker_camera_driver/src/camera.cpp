@@ -229,6 +229,13 @@ void Camera::setImageControlFormats(const spinnaker_camera_driver::SpinnakerConf
   // Apply offset Y
   setProperty(node_map_, "OffsetY", config.image_format_y_offset);
 
+  // Set ADC Bit Depth. Must precede PixelFormat so the sensor is configured
+  // before the output format is locked in. Not all cameras expose this node.
+  if (IsAvailable(node_map_->GetNode("AdcBitDepth")))
+  {
+    setProperty(node_map_, "AdcBitDepth", config.adc_bit_depth);
+  }
+
   // Set Pixel Format
   setProperty(node_map_, "PixelFormat", config.image_format_color_coding);
 
