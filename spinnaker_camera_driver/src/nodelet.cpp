@@ -60,6 +60,7 @@ THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <wfov_camera_msgs/WFOVImage.h>
 #include <image_exposure_msgs/ExposureSequence.h>  // Message type for configuring gain and white balance.
+#include <sensor_msgs/TimeReference.h>             // GPS camera-trigger time from the Pico (via gateway.py).
 
 #include <diagnostic_updater/diagnostic_updater.h>  // Headers for publishing diagnostic messages.
 #include <diagnostic_updater/publisher.h>
@@ -68,8 +69,10 @@ THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <dynamic_reconfigure/server.h>  // Needed for the dynamic_reconfigure gui service to run
 
+#include <deque>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 
@@ -311,6 +314,16 @@ private:
     pnh.param<std::string>("camera_info_url", camera_info_url, "");
     // Get the desired frame_id, set to 'camera' if not found
     pnh.param<std::string>("frame_id", frame_id_, "camera");
+
+    // When true (default), stamp each image at the center of the frame using the GPS trigger
+    // time from /camera_trigger_time plus half the per-frame exposure. Set false for bench
+    // testing without the Pico (falls back to host-arrival stamping).
+    pnh.param<bool>("use_trigger_time", use_trigger_time_, true);
+    // Buffer camera-trigger times (GPS). Absolute topic name on purpose: this nodelet runs
+    // under the camera namespace, so a relative name would resolve to /camera/camera_trigger_time.
+    trigger_sub_ = getMTNodeHandle().subscribe("/camera_trigger_time", 100,
+                                               &SpinnakerCameraNodelet::triggerTimeCallback, this);
+
     // Do not call the connectCb function until after we are done initializing.
     std::lock_guard<std::mutex> scopedLock(connect_mutex_);
 
@@ -593,33 +606,92 @@ private:
 
             // wfov_image->temperature = spinnaker_.getCameraTemperature();
 
-            ros::Time time = ros::Time::now() + ros::Duration(config_.time_offset);
-            wfov_image->header.stamp = time;
-            wfov_image->image.header.stamp = time;
+            // ----- Stamp at the center of the frame: trigger(GPS) + exposure/2 -----
+            const ros::Time t_arr = ros::Time::now();                       // image host-arrival time
+            const double exposure_s = spinnaker_.getExposureTime() * 1e-6;  // chunk microseconds -> s
 
-            // Set the CameraInfo message
-            ci_.reset(new sensor_msgs::CameraInfo(cinfo_->getCameraInfo()));
-            ci_->header.stamp = wfov_image->image.header.stamp;
-            ci_->header.frame_id = wfov_image->header.frame_id;
-            // The height, width, distortion model, and parameters are all filled in by camera info manager.
-            ci_->binning_x = binning_x_;
-            ci_->binning_y = binning_y_;
-            ci_->roi.x_offset = roi_x_offset_;
-            ci_->roi.y_offset = roi_y_offset_;
-            ci_->roi.height = roi_height_;
-            ci_->roi.width = roi_width_;
-            ci_->roi.do_rectify = do_rectify_;
-
-            wfov_image->info = *ci_;
-
-            // Publish the full message
-            pub_->publish(wfov_image);
-
-            // Publish the message using standard image transport
-            if (it_pub_.getNumSubscribers() > 0)
+            ros::Time time;
+            bool have_stamp = false;
+            if (use_trigger_time_)
             {
-              sensor_msgs::ImagePtr image(new sensor_msgs::Image(wfov_image->image));
-              it_pub_.publish(image, ci_);
+              const double kMatchWindow = 0.15;  // s; image-arrival vs trigger-arrival sanity gap
+              sensor_msgs::TimeReference matched;
+              bool matched_ok = false;
+              {
+                std::lock_guard<std::mutex> lk(trigger_mutex_);
+                // Newest trigger whose host-arrival precedes this image's arrival; the trigger
+                // always arrives before its image, so this is the one that fired this frame.
+                int best = -1;
+                for (int i = static_cast<int>(trigger_buf_.size()) - 1; i >= 0; --i)
+                {
+                  if (trigger_buf_[i].header.stamp <= t_arr)
+                  {
+                    best = i;
+                    break;
+                  }
+                }
+                if (best >= 0 && (t_arr - trigger_buf_[best].header.stamp).toSec() <= kMatchWindow)
+                {
+                  matched = trigger_buf_[best];
+                  matched_ok = true;
+                  for (int i = 0; i <= best; ++i)  // consume the matched trigger and all older ones
+                    trigger_buf_.pop_front();
+                }
+              }
+              if (matched_ok)
+              {
+                // time_ref is the GPS instant of the trigger; add half the exposure to land on
+                // the photometric center of the (global-shutter) frame. time_offset is a manual trim.
+                time = matched.time_ref + ros::Duration(exposure_s / 2.0 + config_.time_offset);
+                have_stamp = true;
+                NODELET_DEBUG_THROTTLE(5.0, "Stamped image at trigger %.6f + exposure/2 %.4f ms",
+                                       matched.time_ref.toSec(), exposure_s * 1e3 / 2.0);
+              }
+              else
+              {
+                // Should never happen: the trigger always precedes the image. If it does,
+                // something upstream (Pico / serial / gateway) is broken — drop the frame rather
+                // than emit a wrongly-stamped image; a sustained gap trips topic_watchdog -> 'R'.
+                NODELET_ERROR_THROTTLE(2.0,
+                    "No /camera_trigger_time matched image (arrival=%.3f, buffered=%zu); dropping frame.",
+                    t_arr.toSec(), trigger_buf_.size());
+              }
+            }
+            else
+            {
+              time = t_arr + ros::Duration(config_.time_offset);  // legacy / bench stamping
+              have_stamp = true;
+            }
+
+            if (have_stamp)
+            {
+              wfov_image->header.stamp = time;
+              wfov_image->image.header.stamp = time;
+
+              // Set the CameraInfo message
+              ci_.reset(new sensor_msgs::CameraInfo(cinfo_->getCameraInfo()));
+              ci_->header.stamp = wfov_image->image.header.stamp;
+              ci_->header.frame_id = wfov_image->header.frame_id;
+              // The height, width, distortion model, and parameters are all filled in by camera info manager.
+              ci_->binning_x = binning_x_;
+              ci_->binning_y = binning_y_;
+              ci_->roi.x_offset = roi_x_offset_;
+              ci_->roi.y_offset = roi_y_offset_;
+              ci_->roi.height = roi_height_;
+              ci_->roi.width = roi_width_;
+              ci_->roi.do_rectify = do_rectify_;
+
+              wfov_image->info = *ci_;
+
+              // Publish the full message
+              pub_->publish(wfov_image);
+
+              // Publish the message using standard image transport
+              if (it_pub_.getNumSubscribers() > 0)
+              {
+                sensor_msgs::ImagePtr image(new sensor_msgs::Image(wfov_image->image));
+                it_pub_.publish(image, ci_);
+              }
             }
           }
           catch (CameraTimeoutException& e)
@@ -665,6 +737,18 @@ private:
     }
   }
 
+  // Buffer GPS camera-trigger times published by gateway.py. The matching image arrives a
+  // little later (after exposure + readout + USB transfer), so by grab time the correct
+  // trigger is already buffered and is the newest one preceding the image's arrival.
+  void triggerTimeCallback(const sensor_msgs::TimeReference::ConstPtr& msg)
+  {
+    const size_t kMaxTriggerBuffer = 500;  // cap growth if the camera isn't grabbing
+    std::lock_guard<std::mutex> lk(trigger_mutex_);
+    trigger_buf_.push_back(*msg);
+    while (trigger_buf_.size() > kMaxTriggerBuffer)
+      trigger_buf_.pop_front();
+  }
+
   /* Class Fields */
   std::shared_ptr<dynamic_reconfigure::Server<spinnaker_camera_driver::SpinnakerConfig> > srv_;  ///< Needed to
                                                                                                  ///  initialize
@@ -683,6 +767,11 @@ private:
   /// constructor
   /// requirements
   ros::Subscriber sub_;  ///< Subscriber for gain and white balance changes.
+
+  ros::Subscriber trigger_sub_;  ///< Subscriber for /camera_trigger_time (GPS trigger instants).
+  std::deque<sensor_msgs::TimeReference> trigger_buf_;  ///< Buffered trigger times, paired to images.
+  std::mutex trigger_mutex_;     ///< Guards trigger_buf_.
+  bool use_trigger_time_;        ///< Stamp at trigger + exposure/2 (true) or host-arrival time (false).
 
   std::mutex connect_mutex_;
 

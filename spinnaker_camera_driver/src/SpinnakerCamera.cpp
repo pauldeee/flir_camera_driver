@@ -250,8 +250,9 @@ void SpinnakerCamera::connect()
         ROS_WARN("SpinnakerCamera::connect: Could not detect camera model name.");
       }
 
-      // Configure chunk data - Enable Metadata
-      // SpinnakerCamera::ConfigureChunkData(*node_map_);
+      // Configure chunk data - Enable Metadata. Needed for the per-frame ChunkExposureTime
+      // that the nodelet uses to stamp images at the center of the frame (trigger + exposure/2).
+      SpinnakerCamera::ConfigureChunkData(*node_map_);
     }
     catch (const Spinnaker::Exception& e)
     {
@@ -357,7 +358,19 @@ void SpinnakerCamera::grabImage(sensor_msgs::Image* image, const std::string& fr
         image_ptr = pCam_->GetNextImage(timeout_);
       }
 
-      // Set Image Time Stamp
+      // Capture per-frame chunk metadata (exposure time, etc.) for this image. The nodelet
+      // reads it back via getExposureTime() to offset the stamp to the center of the frame.
+      try
+      {
+        image_metadata_ = image_ptr->GetChunkData();
+      }
+      catch (const Spinnaker::Exception& e)
+      {
+        ROS_WARN_STREAM_THROTTLE(5.0, "[SpinnakerCamera::grabImage] Chunk data unavailable: " << e.what());
+      }
+
+      // Set Image Time Stamp (device clock; overwritten by the nodelet with the
+      // trigger-derived stamp, retained here only as a fallback default).
       image->header.stamp.sec = image_ptr->GetTimeStamp() * 1e-9;
       image->header.stamp.nsec = image_ptr->GetTimeStamp();
 
@@ -469,6 +482,20 @@ void SpinnakerCamera::grabImage(sensor_msgs::Image* image, const std::string& fr
     throw std::runtime_error("[SpinnakerCamera::grabImage] Not connected to the camera.");
   }
 }  // end grabImage
+
+double SpinnakerCamera::getExposureTime()
+{
+  // ChunkExposureTime is reported in microseconds. Populated by grabImage() from the most
+  // recently grabbed image's chunk data; returns 0.0 if chunk data was unavailable.
+  try
+  {
+    return static_cast<double>(image_metadata_.GetExposureTime());
+  }
+  catch (const Spinnaker::Exception&)
+  {
+    return 0.0;
+  }
+}
 
 void SpinnakerCamera::setTimeout(const double& timeout)
 {

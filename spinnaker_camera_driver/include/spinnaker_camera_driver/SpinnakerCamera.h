@@ -171,6 +171,12 @@ public:
     return serial_;
   }
 
+  /*!
+   * \brief Exposure time (microseconds) of the most recently grabbed image, read from its
+   * chunk metadata. Returns 0.0 if chunk data is unavailable. Call after grabImage().
+   */
+  double getExposureTime();
+
 private:
   uint32_t serial_;  ///< A variable to hold the serial number of the desired camera.
 
