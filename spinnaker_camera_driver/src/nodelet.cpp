@@ -61,6 +61,7 @@ THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <wfov_camera_msgs/WFOVImage.h>
 #include <image_exposure_msgs/ExposureSequence.h>  // Message type for configuring gain and white balance.
 #include <sensor_msgs/TimeReference.h>             // GPS camera-trigger time from the Pico (via gateway.py).
+#include <std_msgs/Float64.h>                       // /camera/exposure_time side-car (per-frame exposure, seconds).
 
 #include <diagnostic_updater/diagnostic_updater.h>  // Headers for publishing diagnostic messages.
 #include <diagnostic_updater/publisher.h>
@@ -347,6 +348,11 @@ private:
     it_.reset(new image_transport::ImageTransport(nh));
     image_transport::SubscriberStatusCallback cb = boost::bind(&SpinnakerCameraNodelet::connectCb, this);
     it_pub_ = it_->advertiseCamera("image_raw", queue_size, cb, cb);
+
+    // Per-frame exposure time (seconds) as an image side-car on /camera/exposure_time.
+    // Published 1:1 with each stamped image; lets downstream tools recover frame
+    // start/end (image stamp ∓ exposure/2) and gauge motion blur.
+    exposure_pub_ = nh.advertise<std_msgs::Float64>("exposure_time", queue_size);
 
     // Set up diagnostics
     updater_.setHardwareID("spinnaker_camera " + cinfo_name.str());
@@ -686,6 +692,13 @@ private:
               // Publish the full message
               pub_->publish(wfov_image);
 
+              // Side-car: the same per-frame exposure (s) used to center the stamp
+              // above. Emitted every stamped frame so the bag keeps it 1:1 with the
+              // image; consumers derive frame start/end and motion blur from it.
+              std_msgs::Float64 exposure_msg;
+              exposure_msg.data = exposure_s;
+              exposure_pub_.publish(exposure_msg);
+
               // Publish the message using standard image transport
               if (it_pub_.getNumSubscribers() > 0)
               {
@@ -760,6 +773,7 @@ private:
   std::shared_ptr<camera_info_manager::CameraInfoManager> cinfo_;  ///< Needed to initialize and keep the
                                                                    /// CameraInfoManager in scope.
   image_transport::CameraPublisher it_pub_;                        ///< CameraInfoManager ROS publisher
+  ros::Publisher exposure_pub_;                                    ///< /camera/exposure_time side-car (std_msgs/Float64, s)
   std::shared_ptr<diagnostic_updater::DiagnosedPublisher<wfov_camera_msgs::WFOVImage> > pub_;  ///< Diagnosed
   std::shared_ptr<ros::Publisher> diagnostics_pub_;
   /// publisher, has to be
